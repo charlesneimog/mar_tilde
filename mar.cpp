@@ -5,11 +5,15 @@
 #define MINIMP3_IMPLEMENTATION
 #include <minimp3_ex.h>
 
+#define CLOWNRESAMPLER_IMPLEMENTATION
+#include <clownresampler.h>
+
 static t_class *mar_tilde_class;
 
 typedef struct _mar_tilde {
     t_object x_obj;
     t_sample x_f;
+    t_clock *clock;
 
     // MP3 state
     mp3dec_t mp3d;
@@ -18,14 +22,21 @@ typedef struct _mar_tilde {
 
     // Playback state
     size_t current_frame;
+    size_t total_frames;
     int playing;
     int loop;
     int channels;
+    int using_resampled;
 
     // resample
     float *resampled_buffer;
     size_t resampled_frames;
     int source_samplerate;
+    // clownresampler
+    ClownResampler_Precomputed cr_pre;
+    ClownResampler_LowLevel_State cr_state;
+    cc_s16l *cr_input;
+    size_t cr_input_frames;
 
     // DSP
     int block_size;
@@ -34,142 +45,108 @@ typedef struct _mar_tilde {
 } t_mar_tilde;
 
 // ─────────────────────────────────────
-static void hermite_resample(float *input, float *output, int channels, size_t input_frames,
-                             size_t output_frames, double step) {
-    double pos = 0.0;
+typedef struct {
+    float *out;
+    size_t frames_remaining;
+    int channels;
+} cr_out_cb_data;
 
-    for (size_t i = 0; i < output_frames; i++) {
-        int idx = (int)pos;
-        float frac = (float)(pos - (double)idx);
+// ─────────────────────────────────────
+static cc_bool mar_cr_output_cb(void *user, const cc_s32f *frame, cc_u8f ch) {
+    cr_out_cb_data *d = (cr_out_cb_data *)user;
 
-        // Hermite interpolation coefficients
-        float c0, c1, c2, c3;
-
-        // Calculate coefficients for smooth interpolation
-        {
-            float frac2 = frac * frac;
-            float frac3 = frac2 * frac;
-
-            c0 = -0.5f * frac3 + frac2 - 0.5f * frac;
-            c1 = 1.5f * frac3 - 2.5f * frac2 + 1.0f;
-            c2 = -1.5f * frac3 + 2.0f * frac2 + 0.5f * frac;
-            c3 = 0.5f * frac3 - 0.5f * frac2;
-        }
-
-        for (int ch = 0; ch < channels; ch++) {
-            // Get 4 samples for interpolation with bounds checking
-            int idx0 = idx - 1;
-            int idx1 = idx;
-            int idx2 = idx + 1;
-            int idx3 = idx + 2;
-
-            // Clamp indices to valid range
-            idx0 = (idx0 < 0) ? 0 : idx0;
-            idx1 = (idx1 < 0) ? 0 : idx1;
-            idx2 = (idx2 < 0) ? 0 : idx2;
-            idx3 = (idx3 < 0) ? 0 : idx3;
-
-            idx0 = (idx0 >= input_frames) ? input_frames - 1 : idx0;
-            idx1 = (idx1 >= input_frames) ? input_frames - 1 : idx1;
-            idx2 = (idx2 >= input_frames) ? input_frames - 1 : idx2;
-            idx3 = (idx3 >= input_frames) ? input_frames - 1 : idx3;
-
-            float x0 = input[idx0 * channels + ch];
-            float x1 = input[idx1 * channels + ch];
-            float x2 = input[idx2 * channels + ch];
-            float x3 = input[idx3 * channels + ch];
-
-            // Apply Hermite interpolation
-            output[i * channels + ch] = x0 * c0 + x1 * c1 + x2 * c2 + x3 * c3;
-        }
-
-        pos += step;
+    if (d->frames_remaining == 0) {
+        return cc_false;
     }
+
+    for (cc_u8f i = 0; i < ch; ++i) {
+        *d->out++ = frame[i] * (1.0f / 32768.0f);
+    }
+
+    d->frames_remaining--;
+    return cc_true;
 }
 
 // ─────────────────────────────────────
 static int mar_tilde_resample_audio(t_mar_tilde *x) {
     int target_sr = sys_getsr();
-    if (target_sr <= 0) {
-        pd_error(x, "[mar~] invalid system samplerate (%d)", target_sr);
-        target_sr = x->source_samplerate;
+    if (target_sr <= 0 || x->source_samplerate <= 0) {
+        x->using_resampled = 0;
+        return 0;
     }
-    if (target_sr <= 0 || x->source_samplerate <= 0 || target_sr == x->source_samplerate) {
+
+    if (target_sr == x->source_samplerate) {
+        x->using_resampled = 0;
         return 1;
     }
 
-    size_t input_frames = x->info.samples / x->channels;
-    double ratio = (double)target_sr / (double)x->source_samplerate;
-    if (ratio <= 0.0) {
-        pd_error(x, "[mar~] bad resample ratio");
-        return 0;
-    }
-    double step = 1.0 / ratio;
-    x->resampled_frames = (size_t)ceil((double)input_frames * ratio) + 4;
+    size_t in_frames = x->info.samples / x->channels;
 
-    // Allocate float buffer for resampling
-    float *float_buffer = (float *)malloc(x->info.samples * sizeof(float));
-    if (!float_buffer) {
-        pd_error(x, "[mar~] Failed to allocate float conversion buffer");
+    /* Precompute kernel once */
+    ClownResampler_Precompute(&x->cr_pre);
+
+    if (!ClownResampler_LowLevel_Init(&x->cr_state, (cc_u8f)x->channels,
+                                      (cc_u32f)x->source_samplerate, (cc_u32f)target_sr, 20000)) {
+        pd_error(x, "[mar~] clownresampler init failed");
         return 0;
     }
 
-    // Convert int16 to float
-    for (size_t i = 0; i < x->info.samples; i++) {
-        float_buffer[i] = (float)x->info.buffer[i] / 32768.0f;
-    }
+    size_t pad = x->cr_state.lowest_level.integer_stretched_kernel_radius;
+    x->cr_input_frames = in_frames;
 
-    // Allocate resampled buffer
-    x->resampled_buffer = (float *)malloc(x->resampled_frames * x->channels * sizeof(float));
-    if (!x->resampled_buffer) {
-        pd_error(x, "[mar~] Failed to allocate resampled buffer");
-        free(float_buffer);
+    /* Allocate padded input buffer (int16) */
+    x->cr_input = (cc_s16l *)malloc((in_frames + pad * 2) * x->channels * sizeof(cc_s16l));
+
+    if (!x->cr_input) {
         return 0;
     }
 
-    // Perform resampling
-    hermite_resample(float_buffer, x->resampled_buffer, x->channels, input_frames,
-                     x->resampled_frames, step);
+    /* Zero padding */
+    memset(x->cr_input, 0, pad * x->channels * sizeof(cc_s16l));
+    memset(x->cr_input + (pad + in_frames) * x->channels, 0, pad * x->channels * sizeof(cc_s16l));
 
-    // Clean up
-    free(float_buffer);
+    /* Copy decoded MP3 samples */
+    memcpy(x->cr_input + pad * x->channels, x->info.buffer,
+           x->info.samples * sizeof(mp3d_sample_t));
 
-    // Replace original buffer with resampled data
-    free(x->info.buffer);
+    /* Estimate output size conservatively */
+    x->resampled_frames = (size_t)ceil((double)in_frames * target_sr / x->source_samplerate) + 8;
 
-    // Convert back to int16 for compatibility with existing code
-    x->info.buffer =
-        (mp3d_sample_t *)malloc(x->resampled_frames * x->channels * sizeof(mp3d_sample_t));
-    if (!x->info.buffer) {
-        pd_error(x, "[mar~] Failed to allocate final buffer");
-        free(x->resampled_buffer);
-        x->resampled_buffer = NULL;
-        return 0;
-    }
-
-    // Convert float back to int16
-    for (size_t i = 0; i < x->resampled_frames * x->channels; i++) {
-        // Clamp to prevent overflow
-        float sample = x->resampled_buffer[i];
-        if (sample > 1.0f) {
-            sample = 1.0f;
-        }
-        if (sample < -1.0f) {
-            sample = -1.0f;
-        }
-        x->info.buffer[i] = (mp3d_sample_t)(sample * 32767.0f);
-    }
-
-    // Update sample count
-    x->info.samples = x->resampled_frames * x->channels;
-    x->info.hz = target_sr;
-    x->source_samplerate = target_sr;
-
-    // Free the float buffer (we keep the int16 version)
     free(x->resampled_buffer);
     x->resampled_buffer = NULL;
+    x->using_resampled = 0;
+
+    x->resampled_buffer = (float *)malloc(x->resampled_frames * x->channels * sizeof(float));
+
+    if (!x->resampled_buffer) {
+        free(x->cr_input);
+        x->cr_input = NULL;
+        return 0;
+    }
+
+    cr_out_cb_data cb;
+    cb.out = x->resampled_buffer;
+    cb.frames_remaining = x->resampled_frames;
+    cb.channels = x->channels;
+
+    size_t frames_left = in_frames;
+
+    ClownResampler_LowLevel_Resample(&x->cr_state, &x->cr_pre, x->cr_input + pad * x->channels,
+                                     &frames_left, mar_cr_output_cb, &cb);
+
+    x->resampled_frames -= cb.frames_remaining;
+    x->total_frames = x->resampled_frames;
+    x->using_resampled = 1;
+
+    free(x->cr_input);
+    x->cr_input = NULL;
 
     return 1;
+}
+
+// ─────────────────────────────────────
+static void mar_clock_bang(t_mar_tilde *x) {
+    outlet_bang(x->bang_out);
 }
 
 // ─────────────────────────────────────
@@ -205,6 +182,9 @@ static void mar_tilde_open(t_mar_tilde *x, t_symbol *s, int argc, t_atom *argv) 
         }
     }
 
+    x->using_resampled = 0;
+    x->resampled_frames = 0;
+
     // Initialize decoder
     mp3dec_init(&x->mp3d);
 
@@ -219,6 +199,8 @@ static void mar_tilde_open(t_mar_tilde *x, t_symbol *s, int argc, t_atom *argv) 
     x->current_frame = 0;
     x->channels = x->info.channels;
     x->source_samplerate = x->info.hz;
+    x->total_frames = x->info.samples / x->channels;
+    x->using_resampled = 0;
 
     // Check if resampling is needed
     int target_sr = sys_getsr();
@@ -228,14 +210,12 @@ static void mar_tilde_open(t_mar_tilde *x, t_symbol *s, int argc, t_atom *argv) 
         if (!mar_tilde_resample_audio(x)) {
             // Resampling failed, fall back to original
             pd_error(x, "[mar~] Resampling failed, using original sample rate");
-            post("[mar~] Loaded %s - %d channels, %d Hz, %ld samples", nameptr, x->channels,
-                 x->source_samplerate, x->info.samples);
-        } else {
-            post("[mar~] Resampling complete: now %d Hz, %ld samples", target_sr, x->info.samples);
+            x->total_frames = x->info.samples / x->channels;
+            x->using_resampled = 0;
         }
     } else {
-        post("[mar~] Loaded %s - %d channels, %d Hz, %ld samples", nameptr, x->channels,
-             x->source_samplerate, x->info.samples);
+        logpost(x, 3, "[mar~] Loaded %s - %d channels, %d Hz, %ld samples", nameptr, x->channels,
+                x->source_samplerate, x->info.samples);
     }
 
     x->current_frame = 0;
@@ -269,8 +249,9 @@ static t_int *mar_tilde_perform(t_int *w) {
     }
 
     int ch = x->channels;
-    size_t total_frames = x->info.samples / ch;
+    size_t total_frames = x->total_frames;
     mp3d_sample_t *buffer = x->info.buffer;
+    float *resampled = x->resampled_buffer;
     int i = 0;
 
     while (i < n) {
@@ -279,7 +260,7 @@ static t_int *mar_tilde_perform(t_int *w) {
                 x->current_frame = 0;
             } else {
                 x->playing = 0;
-                outlet_bang(x->bang_out);
+                clock_delay(x->clock, 0);
                 while (i < n) {
                     for (int c = 0; c < ch; c++) {
                         out[c * n + i] = 0.0f;
@@ -291,8 +272,14 @@ static t_int *mar_tilde_perform(t_int *w) {
         }
 
         size_t buffer_idx = x->current_frame * ch;
-        for (int c = 0; c < ch; c++) {
-            out[c * n + i] = (t_sample)buffer[buffer_idx + c] / 32768.0f;
+        if (x->using_resampled && resampled) {
+            for (int c = 0; c < ch; c++) {
+                out[c * n + i] = resampled[buffer_idx + c];
+            }
+        } else {
+            for (int c = 0; c < ch; c++) {
+                out[c * n + i] = (t_sample)buffer[buffer_idx + c] / 32768.0f;
+            }
         }
         x->current_frame++;
         i++;
@@ -314,6 +301,10 @@ static void mar_tilde_free(t_mar_tilde *x) {
         free(x->info.buffer);
         x->info.buffer = NULL;
     }
+    if (x->resampled_buffer) {
+        free(x->resampled_buffer);
+        x->resampled_buffer = NULL;
+    }
 }
 
 // ─────────────────────────────────────
@@ -325,9 +316,14 @@ static void *mar_tilde_new(t_symbol *s, int argc, t_atom *argv) {
     x->playing = 0;
     x->loop = 0;
     x->current_frame = 0;
+    x->total_frames = 0;
     x->channels = 1;
     x->block_size = 64;
     x->canvas = canvas_getcurrent();
+    x->clock = clock_new(x, (t_method)mar_clock_bang);
+    x->resampled_buffer = NULL;
+    x->resampled_frames = 0;
+    x->using_resampled = 0;
 
     // Create outlets
     outlet_new(&x->x_obj, &s_signal);             // Audio outlet

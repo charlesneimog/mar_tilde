@@ -32,5 +32,13 @@ if (minimp3_ADDED)
   include_directories("${minimp3_SOURCE_DIR}")
 endif()
 
-pd_add_external(mar~ "${CMAKE_CURRENT_SOURCE_DIR}/mar.cpp")
+cpmaddpackage("gh:Clownacy/clownresampler#master")
+if (clownresampler_ADDED)
+  include_directories("${clownresampler_SOURCE_DIR}")
+endif()
+
+pd_add_external(mar~ "${CMAKE_CURRENT_SOURCE_DIR}/mar.cpp" LINK_LIBRARIES clownresampler)
+
+
+
 

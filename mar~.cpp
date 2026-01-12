@@ -8,6 +8,9 @@
 #define MINIMP3_IMPLEMENTATION
 #include <minimp3_ex.h>
 
+#define MINIFLAC_IMPLEMENTATION
+#include <miniflac.h>
+
 // wav & aiff
 #include <AudioFile.h>
 
@@ -16,9 +19,9 @@
 
 static t_class *mar_tilde_class;
 
-// ═════════════════════════════════════
-// UNIFIED AUDIO BUFFER
-// ═════════════════════════════════════
+// ╭─────────────────────────────────────╮
+// │        UNIFIED AUDIO BUFFER         │
+// ╰─────────────────────────────────────╯
 struct AudioBuffer {
     int channels;
     int samplerate;
@@ -59,6 +62,7 @@ typedef struct _mar_tilde {
     AudioBuffer audio;
     AudioBuffer resampled;
     int using_resampled;
+    bool resample;
 
     // Playback state
     size_t current_frame;
@@ -172,6 +176,11 @@ static bool resample_audio(const AudioBuffer &input, AudioBuffer &output,
     return true;
 }
 
+// ─────────────────────────────────────
+static void mar_clock_bang(t_mar_tilde *x) {
+    outlet_bang(x->bang_out);
+}
+
 // ╭─────────────────────────────────────╮
 // │             MP3 LOADER              │
 // ╰─────────────────────────────────────╯
@@ -212,6 +221,126 @@ static bool load_mp3(t_mar_tilde *x, const char *fullpath) {
 }
 
 // ╭─────────────────────────────────────╮
+// │             FLAC LOADER             │
+// ╰─────────────────────────────────────╯
+static bool load_flac(t_mar_tilde *x, const char *fullpath) {
+    FILE *file = fopen(fullpath, "rb");
+    if (!file) {
+        pd_error(x, "[mar~] Cannot open FLAC file");
+        return false;
+    }
+
+    fseek(file, 0, SEEK_END);
+    long file_size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+
+    uint8_t *flac_data = (uint8_t *)malloc(file_size);
+    if (!flac_data) {
+        fclose(file);
+        pd_error(x, "[mar~] Memory allocation failed");
+        return false;
+    }
+
+    size_t bytes_read = fread(flac_data, 1, file_size, file);
+    fclose(file);
+
+    if (bytes_read != (size_t)file_size) {
+        free(flac_data);
+        pd_error(x, "[mar~] Failed to read FLAC file");
+        return false;
+    }
+
+    miniflac_t decoder;
+    miniflac_init(&decoder, MINIFLAC_CONTAINER_UNKNOWN);
+
+    int32_t *temp_samples[8] = {NULL};
+    int channels = 0;
+    int samplerate = 0;
+    uint8_t bps = 0;
+    size_t total_samples = 0;
+    bool first_frame = true;
+
+    uint32_t pos = 0;
+    uint32_t length = file_size;
+    uint32_t used = 0;
+    MINIFLAC_RESULT res;
+
+    // Allocate temporary sample buffers
+    for (int i = 0; i < 8; i++) {
+        temp_samples[i] = (int32_t *)malloc(sizeof(int32_t) * 65535);
+        if (!temp_samples[i]) {
+            pd_error(x, "[mar~] Memory allocation failed for sample buffers");
+            for (int j = 0; j < i; j++) {
+                free(temp_samples[j]);
+            }
+            free(flac_data);
+            return false;
+        }
+    }
+
+    while ((res = miniflac_decode(&decoder, &flac_data[pos], length, &used, temp_samples)) ==
+           MINIFLAC_OK) {
+        if (first_frame) {
+            channels = miniflac_frame_channels(&decoder);
+            samplerate = miniflac_frame_sample_rate(&decoder);
+            bps = miniflac_frame_bps(&decoder);
+            first_frame = false;
+        }
+
+        uint16_t block_size = miniflac_frame_block_size(&decoder);
+        total_samples += block_size * channels;
+        length -= used;
+        pos += used;
+        miniflac_sync(&decoder, &flac_data[pos], length, &used);
+        pos += used;
+        length -= used;
+    }
+
+    if (channels == 0 || samplerate == 0 || total_samples == 0) {
+        pd_error(x, "[mar~] Invalid FLAC file or decode failed");
+        for (int i = 0; i < 8; i++) {
+            free(temp_samples[i]);
+        }
+        free(flac_data);
+        return false;
+    }
+
+    size_t frames = total_samples / channels;
+    x->audio.allocate(channels, frames, samplerate);
+    pos = 0;
+    length = file_size;
+    size_t current_frame = 0;
+    miniflac_init(&decoder, MINIFLAC_CONTAINER_UNKNOWN);
+
+    while ((res = miniflac_decode(&decoder, &flac_data[pos], length, &used, temp_samples)) ==
+           MINIFLAC_OK) {
+        uint16_t block_size = miniflac_frame_block_size(&decoder);
+        float normalization_factor = 1.0f / (float)(1 << (bps - 1));
+        for (uint16_t i = 0; i < block_size && current_frame + i < frames; i++) {
+            for (int c = 0; c < channels; c++) {
+                float normalized = (float)temp_samples[c][i] * normalization_factor;
+                x->audio.channel_data[c][current_frame + i] = normalized;
+            }
+        }
+        current_frame += block_size;
+        length -= used;
+        pos += used;
+        miniflac_sync(&decoder, &flac_data[pos], length, &used);
+        pos += used;
+        length -= used;
+    }
+
+    // Clean up
+    for (int i = 0; i < 8; i++) {
+        free(temp_samples[i]);
+    }
+    free(flac_data);
+    logpost(x, 3, "[mar~] Loaded FLAC: %d channels, %d Hz, %zu frames, %d-bit", channels,
+            samplerate, frames, bps);
+    return true;
+}
+
+// ╭─────────────────────────────────────╮
 // │           WAV/AIFF LOADER           │
 // ╰─────────────────────────────────────╯
 static bool load_wav_aiff(t_mar_tilde *x, const char *fullpath) {
@@ -248,16 +377,14 @@ static bool load_wav_aiff(t_mar_tilde *x, const char *fullpath) {
 }
 
 // ─────────────────────────────────────
-static void mar_clock_bang(t_mar_tilde *x) {
-    outlet_bang(x->bang_out);
-}
-
-// ─────────────────────────────────────
 static void mar_tilde_open(t_mar_tilde *x, t_symbol *s, int argc, t_atom *argv) {
     if (argc < 1 || argv[0].a_type != A_SYMBOL) {
         pd_error(x, "[mar~] open: missing filename");
         return;
     }
+
+    x->resampled.clear();
+    x->audio.clear();
 
     char dirbuf[MAXPDSTRING], *nameptr;
     char fullpath[MAXPDSTRING];
@@ -289,8 +416,7 @@ static void mar_tilde_open(t_mar_tilde *x, t_symbol *s, int argc, t_atom *argv) 
                        !strcasecmp(dot, ".aif"))) {
         loaded = load_wav_aiff(x, fullpath);
     } else if (dot && !strcasecmp(dot, ".flac")) {
-        pd_error(x, "[mar~] .flac not supported yet");
-        return;
+        loaded = load_flac(x, fullpath);
     } else {
         pd_error(x, "[mar~] Supported formats: .mp3, .wav, .aiff, .aif");
         return;
@@ -302,7 +428,7 @@ static void mar_tilde_open(t_mar_tilde *x, t_symbol *s, int argc, t_atom *argv) 
 
     // Resample if needed
     int target_sr = sys_getsr();
-    if (x->audio.samplerate != target_sr) {
+    if (x->audio.samplerate != target_sr && x->resample) {
         post("[mar~] Resampling from %d Hz to %d Hz", x->audio.samplerate, target_sr);
 
         if (resample_audio(x->audio, x->resampled, (double)target_sr)) {
@@ -357,11 +483,11 @@ static t_int *mar_tilde_perform(t_int *w) {
     for (int i = 0; i < n; i++) {
         if (x->current_frame >= total_frames) {
             if (x->loop) {
+                clock_delay(x->clock, 0);
                 x->current_frame = 0;
             } else {
-                x->playing = 0;
                 clock_delay(x->clock, 0);
-                // Fill rest with silence
+                x->playing = 0;
                 for (int j = i; j < n; j++) {
                     for (int c = 0; c < ch; c++) {
                         out[c * n + j] = 0.0f;
@@ -411,6 +537,43 @@ static void *mar_tilde_new(t_symbol *s, int argc, t_atom *argv) {
     x->block_size = 64;
     x->canvas = canvas_getcurrent();
     x->clock = clock_new(x, (t_method)mar_clock_bang);
+    x->resample = true;
+    x->loop = false;
+
+    int i = 0;
+    while (i < argc) {
+        if (argv[i].a_type == A_SYMBOL) {
+            t_symbol *sym = atom_getsymbol(&argv[i]);
+            if (strcmp("-loop", sym->s_name) == 0) {
+                x->loop = true;
+            } else if (strcmp("-nor", sym->s_name) == 0) {
+                x->resample = false;
+            } else {
+                const char *dot = strrchr(sym->s_name, '.');
+                bool isaudio = false;
+                t_atom file[1];
+                if (dot && !strcasecmp(dot, ".mp3")) {
+                    isaudio = true;
+                } else if (dot && !strcasecmp(dot, ".wav")) {
+                    isaudio = true;
+                } else if (dot && !strcasecmp(dot, ".aiff")) {
+                    isaudio = true;
+                } else if (dot && !strcasecmp(dot, ".aif")) {
+                    isaudio = true;
+                } else if (dot && !strcasecmp(dot, ".flac")) {
+                    isaudio = true;
+                }
+                if (isaudio) {
+                    SETSYMBOL(&file[0], sym);
+                    mar_tilde_open(x, gensym("open"), 1, file);
+                }
+            }
+        } else if (argv[i].a_type == A_FLOAT) {
+            x->playing = atom_getfloat(&argv[i]) == 1;
+        }
+
+        i++;
+    }
 
     outlet_new(&x->x_obj, &s_signal);
     x->bang_out = outlet_new(&x->x_obj, &s_bang);

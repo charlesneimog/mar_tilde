@@ -24,6 +24,6 @@ cmake --build build
 * [AudioFile](https://github.com/adamstark/AudioFile)
 * [r8brain-free-src](https://github.com/avaneev/r8brain-free-src)
 
-## Status
+## Audio Example
 
-* FLAC support: TODO
+* Example sound: [Piano loop: Sloka 3 - 90bpm 3/4](https://freesound.org/people/trader_one/sounds/683575/) by _trader_one_.

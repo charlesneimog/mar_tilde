@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(mar)
+project(mar~)
 
 # ╭──────────────────────────────────────╮
 # │             CPM Package              │
@@ -26,19 +26,30 @@ if(NOT EXISTS "${PDCMAKE_FILE}")
 endif()
 include(${PDCMAKE_FILE})
 
-# Packages
+# ╭──────────────────────────────────────╮
+# │                 MP3                  │
+# ╰──────────────────────────────────────╯
 cpmaddpackage("gh:lieff/minimp3#master")
 if (minimp3_ADDED)
   include_directories("${minimp3_SOURCE_DIR}")
 endif()
 
-cpmaddpackage("gh:Clownacy/clownresampler#master")
-if (clownresampler_ADDED)
-  include_directories("${clownresampler_SOURCE_DIR}")
+# ╭──────────────────────────────────────╮
+# │              WAV & AIFF              │
+# ╰──────────────────────────────────────╯
+cpmaddpackage("gh:adamstark/AudioFile#master")
+
+# ╭──────────────────────────────────────╮
+# │                 FLAC                 │
+# ╰──────────────────────────────────────╯
+# TODO:
+
+# ╭──────────────────────────────────────╮
+# │              Resampler               │
+# ╰──────────────────────────────────────╯
+cpmaddpackage("gh:avaneev/r8brain-free-src#master")
+if (r8brain-free-src_ADDED)
+  include_directories("${r8brain-free-src_SOURCE_DIR}")
 endif()
 
-pd_add_external(mar~ "${CMAKE_CURRENT_SOURCE_DIR}/mar.cpp" LINK_LIBRARIES clownresampler)
-
-
-
-
+pd_add_external(mar~ "${CMAKE_CURRENT_SOURCE_DIR}/mar~.cpp" LINK_LIBRARIES AudioFile)

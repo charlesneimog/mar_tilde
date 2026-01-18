@@ -4,12 +4,20 @@
 #include <algorithm>
 #include <memory>
 #include <vector>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 
 #define MINIMP3_IMPLEMENTATION
 #include <minimp3_ex.h>
 
 #define MINIFLAC_IMPLEMENTATION
 #include <miniflac.h>
+
+// Ogg Vorbis
+#define STB_VORBIS_IMPLEMENTATION
+#include <stb_vorbis.c>
 
 // wav & aiff
 #include <AudioFile.h>
@@ -26,7 +34,8 @@ struct AudioBuffer {
     int channels;
     int samplerate;
     size_t frames;
-    std::vector<std::vector<float>> channel_data; // channel_data[ch][frame]
+    // Planar, contiguous: data[ch * frames + frame]
+    std::vector<float> data;
 
     AudioBuffer() : channels(0), samplerate(0), frames(0) {}
 
@@ -34,22 +43,31 @@ struct AudioBuffer {
         channels = ch;
         frames = fr;
         samplerate = sr;
-        channel_data.clear();
-        channel_data.resize(ch);
-        for (int c = 0; c < ch; ++c) {
-            channel_data[c].resize(fr, 0.0f);
+        if (ch <= 0 || fr == 0) {
+            clear();
+            return;
         }
+        data.assign((size_t)ch * fr, 0.0f);
     }
 
     void clear() {
         channels = 0;
         samplerate = 0;
         frames = 0;
-        channel_data.clear();
+        data.clear();
+        data.shrink_to_fit();
     }
 
     bool empty() const {
-        return frames == 0 || channels == 0;
+        return frames == 0 || channels == 0 || data.empty();
+    }
+
+    float *channel_ptr(int c) {
+        return data.data() + ((size_t)c * frames);
+    }
+
+    const float *channel_ptr(int c) const {
+        return data.data() + ((size_t)c * frames);
     }
 };
 
@@ -109,8 +127,9 @@ static bool resample_audio(const AudioBuffer &input, AudioBuffer &output,
     }
 
     std::vector<std::vector<double>> temp_output(ch);
+    std::vector<size_t> write_pos((size_t)ch, 0);
     for (int c = 0; c < ch; ++c) {
-        temp_output[c].reserve(estimated_frames);
+        temp_output[c].resize(estimated_frames);
     }
 
     const size_t block = 1024;
@@ -123,14 +142,18 @@ static bool resample_audio(const AudioBuffer &input, AudioBuffer &output,
 
         for (int c = 0; c < ch; ++c) {
             for (size_t i = 0; i < n; ++i) {
-                in_block[i] = (double)input.channel_data[c][pos + i];
+                in_block[i] = (double)input.channel_ptr(c)[pos + i];
             }
 
             int produced = resamplers[c]->process(in_block.data(), (int)n, out_block);
             if (produced > 0) {
-                for (int i = 0; i < produced; ++i) {
-                    temp_output[c].push_back(out_block[i]);
+                const size_t need = write_pos[(size_t)c] + (size_t)produced;
+                if (need > temp_output[c].size()) {
+                    temp_output[c].resize(need + 64);
                 }
+                std::copy(out_block, out_block + produced,
+                          temp_output[c].begin() + (ptrdiff_t)write_pos[(size_t)c]);
+                write_pos[(size_t)c] = need;
             }
         }
     }
@@ -145,9 +168,13 @@ static bool resample_audio(const AudioBuffer &input, AudioBuffer &output,
                 produced = p;
             }
             if (p > 0) {
-                for (int i = 0; i < p; ++i) {
-                    temp_output[c].push_back(out_block[i]);
+                const size_t need = write_pos[(size_t)c] + (size_t)p;
+                if (need > temp_output[c].size()) {
+                    temp_output[c].resize(need + 64);
                 }
+                std::copy(out_block, out_block + p,
+                          temp_output[c].begin() + (ptrdiff_t)write_pos[(size_t)c]);
+                write_pos[(size_t)c] = need;
             }
         }
         if (produced <= 0) {
@@ -156,9 +183,9 @@ static bool resample_audio(const AudioBuffer &input, AudioBuffer &output,
     }
 
     // Verify all channels have same length
-    size_t out_frames = temp_output[0].size();
+    size_t out_frames = write_pos.empty() ? 0 : write_pos[0];
     for (int c = 1; c < ch; ++c) {
-        if (temp_output[c].size() != out_frames) {
+        if (write_pos[(size_t)c] != out_frames) {
             return false;
         }
     }
@@ -168,9 +195,10 @@ static bool resample_audio(const AudioBuffer &input, AudioBuffer &output,
 
     // Copy data
     for (int c = 0; c < ch; ++c) {
-        for (size_t f = 0; f < out_frames; ++f) {
-            output.channel_data[c][f] = (float)temp_output[c][f];
-        }
+        float *dst = output.channel_ptr(c);
+        const double *src = temp_output[c].data();
+        std::transform(src, src + (ptrdiff_t)out_frames, dst,
+                       [](double v) { return (float)v; });
     }
 
     return true;
@@ -208,7 +236,7 @@ static bool load_mp3(t_mar_tilde *x, const char *fullpath) {
     const mp3d_sample_t *src = info.buffer;
     for (size_t f = 0; f < frames; ++f) {
         for (int c = 0; c < channels; ++c) {
-            x->audio.channel_data[c][f] = (float)src[f * channels + c] / 32768.0f;
+            x->audio.channel_ptr(c)[f] = (float)src[f * channels + c] / 32768.0f;
         }
     }
 
@@ -217,6 +245,45 @@ static bool load_mp3(t_mar_tilde *x, const char *fullpath) {
     logpost(x, 3, "[mar~] Loaded MP3: %d channels, %d Hz, %zu frames", channels, samplerate,
             frames);
 
+    return true;
+}
+
+
+// ╭─────────────────────────────────────╮
+// │          OGG VORBIS LOADER          │
+// ╰─────────────────────────────────────╯
+static bool load_ogg(t_mar_tilde *x, const char *fullpath) {
+    int channels = 0;
+    int samplerate = 0;
+    short *interleaved = nullptr;
+
+    // Returns number of samples PER CHANNEL, and allocates interleaved output with malloc().
+    const int samples_per_channel =
+        stb_vorbis_decode_filename(fullpath, &channels, &samplerate, &interleaved);
+
+    if (samples_per_channel <= 0 || !interleaved || channels <= 0 || samplerate <= 0) {
+        if (interleaved) {
+            free(interleaved);
+        }
+        pd_error(x, "[mar~] OGG (Vorbis) decode failed");
+        return false;
+    }
+
+    const size_t frames = (size_t)samples_per_channel;
+    x->audio.allocate(channels, frames, samplerate);
+
+    constexpr float scale = 1.0f / 32768.0f;
+    for (size_t f = 0; f < frames; ++f) {
+        const size_t base = f * (size_t)channels;
+        for (int c = 0; c < channels; ++c) {
+            x->audio.channel_ptr(c)[f] = (float)interleaved[base + (size_t)c] * scale;
+        }
+    }
+
+    free(interleaved);
+
+    logpost(x, 3, "[mar~] Loaded OGG (Vorbis): %d channels, %d Hz, %zu frames", channels,
+            samplerate, frames);
     return true;
 }
 
@@ -319,7 +386,7 @@ static bool load_flac(t_mar_tilde *x, const char *fullpath) {
         for (uint16_t i = 0; i < block_size && current_frame + i < frames; i++) {
             for (int c = 0; c < channels; c++) {
                 float normalized = (float)temp_samples[c][i] * normalization_factor;
-                x->audio.channel_data[c][current_frame + i] = normalized;
+                x->audio.channel_ptr(c)[current_frame + i] = normalized;
             }
         }
         current_frame += block_size;
@@ -365,8 +432,9 @@ static bool load_wav_aiff(t_mar_tilde *x, const char *fullpath) {
 
     // Copy per-channel data (AudioFile already stores non-interleaved)
     for (int c = 0; c < channels; ++c) {
+        float *dst = x->audio.channel_ptr(c);
         for (size_t f = 0; f < frames; ++f) {
-            x->audio.channel_data[c][f] = a.samples[c][f];
+            dst[f] = a.samples[c][f];
         }
     }
 
@@ -410,6 +478,14 @@ static void mar_tilde_open(t_mar_tilde *x, t_symbol *s, int argc, t_atom *argv) 
     const char *dot = strrchr(fullpath, '.');
     bool loaded = false;
 
+    const auto t0 = std::chrono::steady_clock::now();
+
+    auto report_time = [&]() {
+        const auto t1 = std::chrono::steady_clock::now();
+        const auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        post("[mar~] open took %lld µs", (long long)us);
+    };
+
     if (dot && !strcasecmp(dot, ".mp3")) {
         loaded = load_mp3(x, fullpath);
     } else if (dot && (!strcasecmp(dot, ".wav") || !strcasecmp(dot, ".aiff") ||
@@ -417,10 +493,13 @@ static void mar_tilde_open(t_mar_tilde *x, t_symbol *s, int argc, t_atom *argv) 
         loaded = load_wav_aiff(x, fullpath);
     } else if (dot && !strcasecmp(dot, ".flac")) {
         loaded = load_flac(x, fullpath);
+    } else if (dot && !strcasecmp(dot, ".ogg")) {
+        loaded = load_ogg(x, fullpath);
     } else {
-        pd_error(x, "[mar~] Supported formats: .mp3, .wav, .aiff, .aif");
+        pd_error(x, "[mar~] Supported formats: .mp3, .wav, .aiff, .aif, .ogg, .flac");
         return;
     }
+    report_time();
 
     if (!loaded) {
         return;
@@ -469,39 +548,42 @@ static t_int *mar_tilde_perform(t_int *w) {
     const int ch = buf.channels > 0 ? buf.channels : 1;
 
     if (buf.empty() || !x->playing) {
-        // Output silence
-        for (int i = 0; i < n; i++) {
-            for (int c = 0; c < ch; c++) {
-                out[c * n + i] = 0.0f;
-            }
-        }
+        // Output silence (planar buffer is contiguous)
+        std::fill(out, out + ((size_t)ch * (size_t)n), 0.0f);
         return w + 4;
     }
 
     const size_t total_frames = buf.frames;
 
-    for (int i = 0; i < n; i++) {
+    int out_pos = 0;
+    while (out_pos < n) {
         if (x->current_frame >= total_frames) {
+            clock_delay(x->clock, 0);
             if (x->loop) {
-                clock_delay(x->clock, 0);
                 x->current_frame = 0;
             } else {
-                clock_delay(x->clock, 0);
                 x->playing = 0;
-                for (int j = i; j < n; j++) {
-                    for (int c = 0; c < ch; c++) {
-                        out[c * n + j] = 0.0f;
-                    }
+                // Zero remainder
+                std::fill(out + (size_t)out_pos, out + (size_t)n, 0.0f);
+                for (int c = 1; c < ch; ++c) {
+                    std::fill(out + ((size_t)c * (size_t)n) + (size_t)out_pos,
+                              out + ((size_t)c * (size_t)n) + (size_t)n, 0.0f);
                 }
                 break;
             }
         }
 
-        // Read from non-interleaved buffer
-        for (int c = 0; c < ch; c++) {
-            out[c * n + i] = buf.channel_data[c][x->current_frame];
+        const size_t remaining = total_frames - x->current_frame;
+        const int to_copy = (int)std::min<size_t>((size_t)(n - out_pos), remaining);
+
+        for (int c = 0; c < ch; ++c) {
+            const float *src = buf.channel_ptr(c) + x->current_frame;
+            float *dst = out + ((size_t)c * (size_t)n) + (size_t)out_pos;
+            std::copy_n(src, to_copy, dst);
         }
-        x->current_frame++;
+
+        x->current_frame += (size_t)to_copy;
+        out_pos += to_copy;
     }
 
     return w + 4;
@@ -562,6 +644,8 @@ static void *mar_tilde_new(t_symbol *s, int argc, t_atom *argv) {
                     isaudio = true;
                 } else if (dot && !strcasecmp(dot, ".flac")) {
                     isaudio = true;
+                } else if (dot && !strcasecmp(dot, ".ogg")) {
+                    isaudio = true;
                 }
                 if (isaudio) {
                     SETSYMBOL(&file[0], sym);
@@ -592,4 +676,5 @@ extern "C" void mar_tilde_setup(void) {
     class_addmethod(mar_tilde_class, (t_method)mar_tilde_loop, gensym("loop"), A_FLOAT, 0);
     class_addfloat(mar_tilde_class, (t_method)mar_tilde_float);
     class_addbang(mar_tilde_class, (t_method)mar_tilde_bang);
+    logpost(nullptr, 3, "[mar~] version 0.1.0");
 }

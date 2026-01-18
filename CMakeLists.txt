@@ -43,6 +43,15 @@ if(miniflac_ADDED)
 endif()
 
 # ╭──────────────────────────────────────╮
+# │              OGG Vorbis              │
+# ╰──────────────────────────────────────╯
+# stb_vorbis is a small, portable Ogg Vorbis decoder (not Opus).
+cpmaddpackage("gh:nothings/stb#master")
+if(stb_ADDED)
+    include_directories("${stb_SOURCE_DIR}")
+endif()
+
+# ╭──────────────────────────────────────╮
 # │              Resampler               │
 # ╰──────────────────────────────────────╯
 cpmaddpackage("gh:avaneev/r8brain-free-src#master")

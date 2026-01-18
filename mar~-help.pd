@@ -1,4 +1,4 @@
-#N canvas 0 0 576 560 10;
+#N canvas 0 0 925 1132 10;
 #X obj 3 5 cnv 15 301 42 empty empty mar~ 20 20 2 37 #e0e0e0 #000000 0;
 #X obj 305 6 cnv 15 250 40 empty empty empty 12 13 0 18 #7c7c7c #e0e4dc 0;
 #N canvas 0 22 450 278 (subpatch) 0;
@@ -30,11 +30,14 @@
 #X text 68 87 [mar~] is an external for loading and playing audio files with automatic resampling;
 #X obj 282 217 bng 18 250 50 0 empty empty empty 0 -9 0 10 #fcfcfc #000000 #000000;
 #X obj 147 217 dac~ 1;
-#X obj 147 195 mar~ -loop sloka.flac 1;
 #X text 360 366 Bang when audio is finished;
-#X msg 147 150 open sloka.mp3 \, 1;
 #X text 125 442 -nor — Deactivate the automatic audio resampling;
 #X text 125 462 1 — Start playback on init;
-#X connect 27 0 26 0;
-#X connect 27 1 25 0;
-#X connect 29 0 27 0;
+#X obj 147 195 build/mar~ -loop sloka.flac 1;
+#X msg 147 129 open sloka.flac \, 1;
+#X msg 167 153 open sloka.ogg \, 1;
+#X connect 25 0 31 0;
+#X connect 30 0 26 0;
+#X connect 30 1 25 0;
+#X connect 31 0 30 0;
+#X connect 32 0 30 0;

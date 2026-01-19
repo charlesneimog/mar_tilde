@@ -1,4 +1,6 @@
 #include <m_pd.h>
+#include <m_imp.h>
+#include <g_canvas.h>
 #include <string.h>
 #include <math.h>
 #include <algorithm>
@@ -89,6 +91,7 @@ typedef struct _mar_tilde {
 
     // DSP
     int block_size;
+    int out_channels;
     t_canvas *canvas;
     t_outlet *bang_out;
 } t_mar_tilde;
@@ -197,8 +200,7 @@ static bool resample_audio(const AudioBuffer &input, AudioBuffer &output,
     for (int c = 0; c < ch; ++c) {
         float *dst = output.channel_ptr(c);
         const double *src = temp_output[c].data();
-        std::transform(src, src + (ptrdiff_t)out_frames, dst,
-                       [](double v) { return (float)v; });
+        std::transform(src, src + (ptrdiff_t)out_frames, dst, [](double v) { return (float)v; });
     }
 
     return true;
@@ -247,7 +249,6 @@ static bool load_mp3(t_mar_tilde *x, const char *fullpath) {
 
     return true;
 }
-
 
 // ╭─────────────────────────────────────╮
 // │          OGG VORBIS LOADER          │
@@ -448,6 +449,7 @@ static bool load_wav_aiff(t_mar_tilde *x, const char *fullpath) {
 static void mar_tilde_open(t_mar_tilde *x, t_symbol *s, int argc, t_atom *argv) {
     if (argc < 1 || argv[0].a_type != A_SYMBOL) {
         pd_error(x, "[mar~] open: missing filename");
+        canvas_update_dsp();
         return;
     }
 
@@ -461,11 +463,13 @@ static void mar_tilde_open(t_mar_tilde *x, t_symbol *s, int argc, t_atom *argv) 
         canvas_open(x->canvas, atom_getsymbol(argv)->s_name, "", dirbuf, &nameptr, MAXPDSTRING, 1);
 
     if (fd < 0) {
-        pd_error(x, "[mar~] cannot open file");
+        pd_error(x, "[mar~]: %s: No such file or directory", atom_getsymbol(argv)->s_name);
+        canvas_update_dsp();
         return;
     }
 
     snprintf(fullpath, MAXPDSTRING, "%s/%s", dirbuf, nameptr);
+    logpost(x, 3, "Opening %s", fullpath);
     sys_close(fd);
 
     // Clear existing buffers
@@ -483,7 +487,7 @@ static void mar_tilde_open(t_mar_tilde *x, t_symbol *s, int argc, t_atom *argv) 
     auto report_time = [&]() {
         const auto t1 = std::chrono::steady_clock::now();
         const auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
-        post("[mar~] open took %lld µs", (long long)us);
+        logpost(x, 3, "[mar~] open took %lld µs", (long long)us);
     };
 
     if (dot && !strcasecmp(dot, ".mp3")) {
@@ -496,12 +500,16 @@ static void mar_tilde_open(t_mar_tilde *x, t_symbol *s, int argc, t_atom *argv) 
     } else if (dot && !strcasecmp(dot, ".ogg")) {
         loaded = load_ogg(x, fullpath);
     } else {
+        x->playing = false;
         pd_error(x, "[mar~] Supported formats: .mp3, .wav, .aiff, .aif, .ogg, .flac");
+        canvas_update_dsp();
         return;
     }
     report_time();
 
     if (!loaded) {
+        x->playing = false;
+        canvas_update_dsp();
         return;
     }
 
@@ -545,11 +553,12 @@ static t_int *mar_tilde_perform(t_int *w) {
     int n = (int)(w[3]);
 
     const AudioBuffer &buf = x->using_resampled ? x->resampled : x->audio;
-    const int ch = buf.channels > 0 ? buf.channels : 1;
+    const int out_ch = x->out_channels > 0 ? x->out_channels : 1;
+    const int buf_ch = buf.channels > 0 ? buf.channels : 0;
+    const int copy_ch = std::min(out_ch, buf_ch);
 
     if (buf.empty() || !x->playing) {
-        // Output silence (planar buffer is contiguous)
-        std::fill(out, out + ((size_t)ch * (size_t)n), 0.0f);
+        std::fill(out, out + ((size_t)out_ch * (size_t)n), 0.0f);
         return w + 4;
     }
 
@@ -564,8 +573,7 @@ static t_int *mar_tilde_perform(t_int *w) {
             } else {
                 x->playing = 0;
                 // Zero remainder
-                std::fill(out + (size_t)out_pos, out + (size_t)n, 0.0f);
-                for (int c = 1; c < ch; ++c) {
+                for (int c = 0; c < out_ch; ++c) {
                     std::fill(out + ((size_t)c * (size_t)n) + (size_t)out_pos,
                               out + ((size_t)c * (size_t)n) + (size_t)n, 0.0f);
                 }
@@ -576,10 +584,14 @@ static t_int *mar_tilde_perform(t_int *w) {
         const size_t remaining = total_frames - x->current_frame;
         const int to_copy = (int)std::min<size_t>((size_t)(n - out_pos), remaining);
 
-        for (int c = 0; c < ch; ++c) {
+        for (int c = 0; c < copy_ch; ++c) {
             const float *src = buf.channel_ptr(c) + x->current_frame;
             float *dst = out + ((size_t)c * (size_t)n) + (size_t)out_pos;
             std::copy_n(src, to_copy, dst);
+        }
+        for (int c = copy_ch; c < out_ch; ++c) {
+            float *dst = out + ((size_t)c * (size_t)n) + (size_t)out_pos;
+            std::fill(dst, dst + (size_t)to_copy, 0.0f);
         }
 
         x->current_frame += (size_t)to_copy;
@@ -595,6 +607,7 @@ static void mar_tilde_dsp(t_mar_tilde *x, t_signal **sp) {
     int ch = buf.channels > 0 ? buf.channels : 1;
 
     signal_setmultiout(&sp[0], ch);
+    x->out_channels = ch;
     x->block_size = sp[0]->s_n;
     dsp_add(mar_tilde_perform, 3, x, sp[0]->s_vec, sp[0]->s_n);
 }
@@ -617,6 +630,7 @@ static void *mar_tilde_new(t_symbol *s, int argc, t_atom *argv) {
     x->current_frame = 0;
     x->using_resampled = 0;
     x->block_size = 64;
+    x->out_channels = 1;
     x->canvas = canvas_getcurrent();
     x->clock = clock_new(x, (t_method)mar_clock_bang);
     x->resample = true;

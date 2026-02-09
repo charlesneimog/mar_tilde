@@ -37,7 +37,7 @@ struct AudioBuffer {
     int samplerate;
     size_t frames;
     // Planar, contiguous: data[ch * frames + frame]
-    std::vector<float> data;
+    std::vector<t_sample> data;
 
     AudioBuffer() : channels(0), samplerate(0), frames(0) {}
 
@@ -64,11 +64,11 @@ struct AudioBuffer {
         return frames == 0 || channels == 0 || data.empty();
     }
 
-    float *channel_ptr(int c) {
+    t_sample *channel_ptr(int c) {
         return data.data() + ((size_t)c * frames);
     }
 
-    const float *channel_ptr(int c) const {
+    const t_sample *channel_ptr(int c) const {
         return data.data() + ((size_t)c * frames);
     }
 };
@@ -198,7 +198,7 @@ static bool resample_audio(const AudioBuffer &input, AudioBuffer &output,
 
     // Copy data
     for (int c = 0; c < ch; ++c) {
-        float *dst = output.channel_ptr(c);
+        t_sample *dst = output.channel_ptr(c);
         const double *src = temp_output[c].data();
         std::transform(src, src + (ptrdiff_t)out_frames, dst, [](double v) { return (float)v; });
     }
@@ -234,7 +234,7 @@ static bool load_mp3(t_mar_tilde *x, const char *fullpath) {
     // Allocate unified buffer
     x->audio.allocate(channels, frames, samplerate);
 
-    // Deinterleave and convert to float [-1, 1]
+    // Deinterleave and convert to t_sample [-1, 1]
     const mp3d_sample_t *src = info.buffer;
     for (size_t f = 0; f < frames; ++f) {
         for (int c = 0; c < channels; ++c) {
@@ -273,7 +273,7 @@ static bool load_ogg(t_mar_tilde *x, const char *fullpath) {
     const size_t frames = (size_t)samples_per_channel;
     x->audio.allocate(channels, frames, samplerate);
 
-    constexpr float scale = 1.0f / 32768.0f;
+    constexpr t_sample scale = 1.0f / 32768.0f;
     for (size_t f = 0; f < frames; ++f) {
         const size_t base = f * (size_t)channels;
         for (int c = 0; c < channels; ++c) {
@@ -383,10 +383,10 @@ static bool load_flac(t_mar_tilde *x, const char *fullpath) {
     while ((res = miniflac_decode(&decoder, &flac_data[pos], length, &used, temp_samples)) ==
            MINIFLAC_OK) {
         uint16_t block_size = miniflac_frame_block_size(&decoder);
-        float normalization_factor = 1.0f / (float)(1 << (bps - 1));
+        t_sample normalization_factor = 1.0f / (float)(1 << (bps - 1));
         for (uint16_t i = 0; i < block_size && current_frame + i < frames; i++) {
             for (int c = 0; c < channels; c++) {
-                float normalized = (float)temp_samples[c][i] * normalization_factor;
+                t_sample normalized = (float)temp_samples[c][i] * normalization_factor;
                 x->audio.channel_ptr(c)[current_frame + i] = normalized;
             }
         }
@@ -433,7 +433,7 @@ static bool load_wav_aiff(t_mar_tilde *x, const char *fullpath) {
 
     // Copy per-channel data (AudioFile already stores non-interleaved)
     for (int c = 0; c < channels; ++c) {
-        float *dst = x->audio.channel_ptr(c);
+        t_sample *dst = x->audio.channel_ptr(c);
         for (size_t f = 0; f < frames; ++f) {
             dst[f] = a.samples[c][f];
         }
@@ -530,13 +530,40 @@ static void mar_tilde_open(t_mar_tilde *x, t_symbol *s, int argc, t_atom *argv) 
 }
 
 // ─────────────────────────────────────
+static void mar_tilde_array(t_mar_tilde *x, t_symbol *s, int argc, t_atom *argv) {
+    // <sound filename> <array name>
+    if (argc != 2) {
+        t_symbol *soundfile = atom_getsymbol(argv);
+        t_symbol *arrayname = atom_getsymbol(argv + 1);
+        mar_tilde_open(x, gensym(""), 1, argv);
+        const AudioBuffer &buf = x->using_resampled ? x->resampled : x->audio;
+
+        // pd array
+        t_garray *pdarray = (t_garray *)pd_findbyclass(arrayname, garray_class);
+        if (pdarray == NULL) {
+            pd_error(x, "[mar~] array not found");
+            return;
+        }
+
+        int vecsize;
+        t_word *vec;
+        garray_resize_long(pdarray, vecsize);
+        garray_getfloatwords(pdarray, &vecsize, &vec);
+        for (int i = 0; i < vecsize; i++) {
+            vec[i].w_float = buf.data[i];
+        }
+        garray_redraw(pdarray);
+    }
+}
+
+// ─────────────────────────────────────
 static void mar_tilde_bang(t_mar_tilde *x) {
     x->playing = 1;
     x->current_frame = 0;
 }
 
 // ─────────────────────────────────────
-static void mar_tilde_float(t_mar_tilde *x, float f) {
+static void mar_tilde_float(t_mar_tilde *x, t_sample f) {
     x->playing = (f != 0);
     x->current_frame = 0;
 }
@@ -585,12 +612,12 @@ static t_int *mar_tilde_perform(t_int *w) {
         const int to_copy = (int)std::min<size_t>((size_t)(n - out_pos), remaining);
 
         for (int c = 0; c < copy_ch; ++c) {
-            const float *src = buf.channel_ptr(c) + x->current_frame;
-            float *dst = out + ((size_t)c * (size_t)n) + (size_t)out_pos;
+            const t_sample *src = buf.channel_ptr(c) + x->current_frame;
+            t_sample *dst = out + ((size_t)c * (size_t)n) + (size_t)out_pos;
             std::copy_n(src, to_copy, dst);
         }
         for (int c = copy_ch; c < out_ch; ++c) {
-            float *dst = out + ((size_t)c * (size_t)n) + (size_t)out_pos;
+            t_sample *dst = out + ((size_t)c * (size_t)n) + (size_t)out_pos;
             std::fill(dst, dst + (size_t)to_copy, 0.0f);
         }
 
@@ -687,6 +714,7 @@ extern "C" void mar_tilde_setup(void) {
 
     class_addmethod(mar_tilde_class, (t_method)mar_tilde_dsp, gensym("dsp"), A_CANT, 0);
     class_addmethod(mar_tilde_class, (t_method)mar_tilde_open, gensym("open"), A_GIMME, 0);
+    class_addmethod(mar_tilde_class, (t_method)mar_tilde_array, gensym("array"), A_GIMME, 0);
     class_addmethod(mar_tilde_class, (t_method)mar_tilde_loop, gensym("loop"), A_FLOAT, 0);
     class_addfloat(mar_tilde_class, (t_method)mar_tilde_float);
     class_addbang(mar_tilde_class, (t_method)mar_tilde_bang);

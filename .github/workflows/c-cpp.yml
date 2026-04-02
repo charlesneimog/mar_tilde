@@ -36,9 +36,9 @@ jobs:
           brew install pd
       - name: Build
         run: |
-          cmake . -B build -DPDLIBDIR=./ -DCMAKE_BUILD_TYPE=Release
+          cmake . -B build -DPD_LIB_DIR=./ -DCMAKE_BUILD_TYPE=Release
           cmake --build build --parallel
-          cmake --install build
+          # cmake --install build
       - name: Upload Object
         uses: actions/upload-artifact@v4
         with:
@@ -75,11 +75,11 @@ jobs:
       - name: Configure
         if: matrix.arch == 'amd64'
         run: |
-          cmake . -B build -DPD_FLOATSIZE=${{ matrix.precision }} -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.arch }} -DPDLIBDIR=./ -DCMAKE_BUILD_TYPE=Release
+          cmake . -B build -DPD_FLOATSIZE=${{ matrix.precision }} -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.arch }} -DPD_LIB_DIR=./ -DCMAKE_BUILD_TYPE=Release
       - name: Build Object
         run: |
           cmake --build build -- -j$(nproc)
-          cmake --install build
+          # cmake --install build
       - name: Upload Object
         uses: actions/upload-artifact@v4
         with:
@@ -117,9 +117,9 @@ jobs:
         shell: msys2 {0}
         if: matrix.compiler == 'mingw'
         run: |
-          cmake . -B build -DPD_FLOATSIZE=${{ matrix.precision }} -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.arch }} -DPDLIBDIR=./ -DCMAKE_BUILD_TYPE=Release
+          cmake . -B build -DPD_FLOATSIZE=${{ matrix.precision }} -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.arch }} -DPD_LIB_DIR=./ -DCMAKE_BUILD_TYPE=Release
           cmake --build build --parallel
-          cmake --install build
+          # cmake --install build
       - name: Upload
         uses: actions/upload-artifact@v4
         with:

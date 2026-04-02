@@ -17,7 +17,10 @@ include(${CPM_FILE})
 set(PDCMAKE_FILE ${CMAKE_BINARY_DIR}/pd.cmake)
 set(PDCMAKE_VERSION "v0.2.11")
 if(NOT EXISTS "${PDCMAKE_FILE}")
-    file(DOWNLOAD "https://github.com/pure-data/pd.cmake/releases/download/v2.0.11/pd.cmake" ${PDCMAKE_FILE})
+    file(DOWNLOAD 
+    # "https://github.com/pure-data/pd.cmake/releases/download/v2.0.11/pd.cmake" 
+    "https://raw.githubusercontent.com/charlesneimog/pd.cmake/refs/heads/flags-test/pd.cmake"
+    ${PDCMAKE_FILE})
 endif()
 include(${PDCMAKE_FILE})
 

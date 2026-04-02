@@ -516,7 +516,7 @@ static void mar_tilde_open(t_mar_tilde *x, t_symbol *s, int argc, t_atom *argv) 
     // Resample if needed
     int target_sr = sys_getsr();
     if (x->audio.samplerate != target_sr && x->resample) {
-        post("[mar~] Resampling from %d Hz to %d Hz", x->audio.samplerate, target_sr);
+        logpost(x, 3, "[mar~] Resampling from %d Hz to %d Hz", x->audio.samplerate, target_sr);
 
         if (resample_audio(x->audio, x->resampled, (double)target_sr)) {
             x->using_resampled = 1;

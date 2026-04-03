@@ -43,7 +43,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{env.LIBNAME}}-${{env.LIBVERSION}}-${{matrix.machines}}-pd${{matrix.precision}}
-          path: ${{env.LIBNAME}}
+          path: build/${{env.LIBNAME}}
   linux-build:
     runs-on: ubuntu-latest
     strategy:
@@ -84,7 +84,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{env.LIBNAME}}-${{env.LIBVERSION}}-${{matrix.arch}}-pd${{matrix.precision}}
-          path: ${{env.LIBNAME}}
+          path: build/${{env.LIBNAME}}
   windows-build:
     runs-on: windows-latest
     strategy:
@@ -123,8 +123,8 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: ${{env.LIBNAME}}-${{env.LIBVERSION}}-${{matrix.machines}}-pd${{matrix.precision}}
-          path: ${{env.LIBNAME}}
+          name: ${{env.LIBNAME}}-${{env.LIBVERSION}}-windows-pd${{matrix.precision}}
+          path: build/mar~
 #╭──────────────────────────────────────╮
 #│   Here an example to how publish a   │
 #│   release, uncomment the input or    │

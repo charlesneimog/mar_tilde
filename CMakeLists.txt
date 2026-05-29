@@ -17,10 +17,9 @@ include(${CPM_FILE})
 set(PDCMAKE_FILE ${CMAKE_BINARY_DIR}/pd.cmake)
 set(PDCMAKE_VERSION "v0.2.11")
 if(NOT EXISTS "${PDCMAKE_FILE}")
-    file(DOWNLOAD 
-    # "https://github.com/pure-data/pd.cmake/releases/download/v2.0.11/pd.cmake" 
-    "https://raw.githubusercontent.com/charlesneimog/pd.cmake/refs/heads/flags-test/pd.cmake"
-    ${PDCMAKE_FILE})
+    file(DOWNLOAD
+         # "https://github.com/pure-data/pd.cmake/releases/download/v2.0.11/pd.cmake"
+         "https://raw.githubusercontent.com/charlesneimog/pd.cmake/refs/heads/flags-test/pd.cmake" ${PDCMAKE_FILE})
 endif()
 include(${PDCMAKE_FILE})
 
@@ -40,7 +39,7 @@ cpmaddpackage("gh:adamstark/AudioFile#master")
 # ╭──────────────────────────────────────╮
 # │                 FLAC                 │
 # ╰──────────────────────────────────────╯
-cpmaddpackage("gh:jprjr/miniflac@1.1.1")
+cpmaddpackage("gh:charlesneimog/miniflac#main")
 if(miniflac_ADDED)
     include_directories("${miniflac_SOURCE_DIR}")
 endif()
@@ -65,8 +64,13 @@ endif()
 # ╭──────────────────────────────────────╮
 # │              Pd Object               │
 # ╰──────────────────────────────────────╯
-pd_add_external(mar~ "${CMAKE_CURRENT_SOURCE_DIR}/mar~.cpp" LINK_LIBRARIES AudioFile)
+pd_add_external(
+    mar~
+    "${CMAKE_CURRENT_SOURCE_DIR}/mar~.cpp"
+    LINK_LIBRARIES
+    AudioFile)
 pd_add_datafile(mar~ "${CMAKE_CURRENT_SOURCE_DIR}/mar~-help.pd")
 
 file(GLOB audio_files "${CMAKE_CURRENT_SOURCE_DIR}/resources/*")
 pd_add_datafile(mar~ "${audio_files}")
+target_compile_options(mar_tilde PRIVATE -ggdb)

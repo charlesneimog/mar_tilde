@@ -531,29 +531,37 @@ static void mar_tilde_open(t_mar_tilde *x, t_symbol *s, int argc, t_atom *argv) 
 
 // ─────────────────────────────────────
 static void mar_tilde_array(t_mar_tilde *x, t_symbol *s, int argc, t_atom *argv) {
-    // <sound filename> <array name>
     if (argc != 2) {
-        t_symbol *soundfile = atom_getsymbol(argv);
-        t_symbol *arrayname = atom_getsymbol(argv + 1);
-        mar_tilde_open(x, gensym(""), 1, argv);
-        const AudioBuffer &buf = x->using_resampled ? x->resampled : x->audio;
-
-        // pd array
-        t_garray *pdarray = (t_garray *)pd_findbyclass(arrayname, garray_class);
-        if (pdarray == NULL) {
-            pd_error(x, "[mar~] array not found");
-            return;
-        }
-
-        int vecsize;
-        t_word *vec;
-        garray_resize_long(pdarray, vecsize);
-        garray_getfloatwords(pdarray, &vecsize, &vec);
-        for (int i = 0; i < vecsize; i++) {
-            vec[i].w_float = buf.data[i];
-        }
-        garray_redraw(pdarray);
+        pd_error(x, "[mar~] array: expected <file> <array>");
+        return;
     }
+
+    t_symbol *soundfile = atom_getsymbol(argv);
+    t_symbol *arrayname = atom_getsymbol(argv + 1);
+    mar_tilde_open(x, gensym(""), 1, argv);
+    const AudioBuffer &buf = x->using_resampled ? x->resampled : x->audio;
+
+    // pd array
+    t_garray *pdarray = (t_garray *)pd_findbyclass(arrayname, garray_class);
+    if (pdarray == NULL) {
+        pd_error(x, "[mar~] array not found");
+        return;
+    }
+
+    int vecsize = (int)buf.frames * buf.channels;
+    garray_resize_long(pdarray, vecsize);
+    t_word *vec;
+
+    if (!garray_getfloatwords(pdarray, &vecsize, &vec)) {
+        pd_error(x, "[mar~] bad array");
+        return;
+    }
+
+    int copy = std::min(vecsize, (int)buf.data.size());
+    for (int i = 0; i < copy; i++) {
+        vec[i].w_float = buf.data[i];
+    }
+    garray_redraw(pdarray);
 }
 
 // ─────────────────────────────────────

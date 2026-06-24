@@ -57,7 +57,6 @@ struct AudioBuffer {
         samplerate = 0;
         frames = 0;
         data.clear();
-        data.shrink_to_fit();
     }
 
     bool empty() const {
@@ -109,7 +108,6 @@ static bool resample_audio(const AudioBuffer &input, AudioBuffer &output,
     }
 
     if (fabs(target_sr - source_sr) < 0.1) {
-        // No resampling needed
         return false;
     }
 
@@ -117,10 +115,11 @@ static bool resample_audio(const AudioBuffer &input, AudioBuffer &output,
     const size_t in_frames = input.frames;
 
     const double ratio = target_sr / source_sr;
-    size_t estimated_frames = (size_t)ceil((double)in_frames * ratio) + 64;
+    const size_t estimated_frames = (size_t)ceil((double)in_frames * ratio) + 64;
 
     std::vector<std::unique_ptr<r8b::CDSPResampler>> resamplers;
     resamplers.reserve(ch);
+
     try {
         for (int c = 0; c < ch; ++c) {
             resamplers.emplace_back(new r8b::CDSPResampler(source_sr, target_sr, 1024));
@@ -131,15 +130,17 @@ static bool resample_audio(const AudioBuffer &input, AudioBuffer &output,
 
     std::vector<std::vector<double>> temp_output(ch);
     std::vector<size_t> write_pos((size_t)ch, 0);
+
     for (int c = 0; c < ch; ++c) {
         temp_output[c].resize(estimated_frames);
     }
 
     const size_t block = 1024;
     std::vector<double> in_block(block);
-    double *out_block = nullptr;
 
-    // Process input blocks
+    // FIX: real output buffer (was nullptr before)
+    std::vector<double> out_block(estimated_frames);
+
     for (size_t pos = 0; pos < in_frames; pos += block) {
         const size_t n = std::min(block, in_frames - pos);
 
@@ -148,44 +149,55 @@ static bool resample_audio(const AudioBuffer &input, AudioBuffer &output,
                 in_block[i] = (double)input.channel_ptr(c)[pos + i];
             }
 
-            int produced = resamplers[c]->process(in_block.data(), (int)n, out_block);
+            double *outp = out_block.data();
+            int produced = resamplers[c]->process(in_block.data(), (int)n, outp);
+
             if (produced > 0) {
-                const size_t need = write_pos[(size_t)c] + (size_t)produced;
-                if (need > temp_output[c].size()) {
-                    temp_output[c].resize(need + 64);
+                size_t &wp = write_pos[(size_t)c];
+
+                if (wp + (size_t)produced > temp_output[c].size()) {
+                    temp_output[c].resize(wp + produced + 64);
                 }
-                std::copy(out_block, out_block + produced,
-                          temp_output[c].begin() + (ptrdiff_t)write_pos[(size_t)c]);
-                write_pos[(size_t)c] = need;
+
+                std::copy(out_block.data(), out_block.data() + produced,
+                          temp_output[c].begin() + wp);
+
+                wp += produced;
             }
         }
     }
 
-    // Flush resamplers
+    // flush
     bool flushing = true;
     while (flushing) {
         int produced = -1;
+
         for (int c = 0; c < ch; ++c) {
-            int p = resamplers[c]->process(nullptr, 0, out_block);
+            double *outp = out_block.data();
+            int p = resamplers[c]->process(nullptr, 0, outp);
+
             if (c == 0) {
                 produced = p;
             }
+
             if (p > 0) {
-                const size_t need = write_pos[(size_t)c] + (size_t)p;
-                if (need > temp_output[c].size()) {
-                    temp_output[c].resize(need + 64);
+                size_t &wp = write_pos[(size_t)c];
+
+                if (wp + (size_t)p > temp_output[c].size()) {
+                    temp_output[c].resize(wp + p + 64);
                 }
-                std::copy(out_block, out_block + p,
-                          temp_output[c].begin() + (ptrdiff_t)write_pos[(size_t)c]);
-                write_pos[(size_t)c] = need;
+
+                std::copy(out_block.data(), out_block.data() + p, temp_output[c].begin() + wp);
+
+                wp += p;
             }
         }
+
         if (produced <= 0) {
             flushing = false;
         }
     }
 
-    // Verify all channels have same length
     size_t out_frames = write_pos.empty() ? 0 : write_pos[0];
     for (int c = 1; c < ch; ++c) {
         if (write_pos[(size_t)c] != out_frames) {
@@ -193,14 +205,13 @@ static bool resample_audio(const AudioBuffer &input, AudioBuffer &output,
         }
     }
 
-    // Allocate output buffer
     output.allocate(ch, out_frames, (int)target_sr);
 
-    // Copy data
     for (int c = 0; c < ch; ++c) {
-        t_sample *dst = output.channel_ptr(c);
         const double *src = temp_output[c].data();
-        std::transform(src, src + (ptrdiff_t)out_frames, dst, [](double v) { return (float)v; });
+        t_sample *dst = output.channel_ptr(c);
+
+        std::transform(src, src + out_frames, dst, [](double v) { return (t_sample)v; });
     }
 
     return true;
@@ -453,6 +464,7 @@ static void mar_tilde_open(t_mar_tilde *x, t_symbol *s, int argc, t_atom *argv) 
         return;
     }
 
+    int state = canvas_suspend_dsp();
     x->resampled.clear();
     x->audio.clear();
 
@@ -465,6 +477,7 @@ static void mar_tilde_open(t_mar_tilde *x, t_symbol *s, int argc, t_atom *argv) 
     if (fd < 0) {
         pd_error(x, "[mar~]: %s: No such file or directory", atom_getsymbol(argv)->s_name);
         canvas_update_dsp();
+        canvas_resume_dsp(state);
         return;
     }
 
@@ -502,14 +515,14 @@ static void mar_tilde_open(t_mar_tilde *x, t_symbol *s, int argc, t_atom *argv) 
     } else {
         x->playing = false;
         pd_error(x, "[mar~] Supported formats: .mp3, .wav, .aiff, .aif, .ogg, .flac");
-        canvas_update_dsp();
+        canvas_resume_dsp(state);
         return;
     }
     report_time();
 
     if (!loaded) {
         x->playing = false;
-        canvas_update_dsp();
+        canvas_resume_dsp(state);
         return;
     }
 
@@ -526,6 +539,7 @@ static void mar_tilde_open(t_mar_tilde *x, t_symbol *s, int argc, t_atom *argv) 
         }
     }
 
+    canvas_resume_dsp(state);
     canvas_update_dsp();
 }
 
@@ -536,31 +550,31 @@ static void mar_tilde_array(t_mar_tilde *x, t_symbol *s, int argc, t_atom *argv)
         return;
     }
 
-    t_symbol *soundfile = atom_getsymbol(argv);
     t_symbol *arrayname = atom_getsymbol(argv + 1);
     mar_tilde_open(x, gensym(""), 1, argv);
     const AudioBuffer &buf = x->using_resampled ? x->resampled : x->audio;
-
-    // pd array
     t_garray *pdarray = (t_garray *)pd_findbyclass(arrayname, garray_class);
-    if (pdarray == NULL) {
+    if (!pdarray) {
         pd_error(x, "[mar~] array not found");
         return;
     }
 
-    int vecsize = (int)buf.frames * buf.channels;
-    garray_resize_long(pdarray, vecsize);
+    int vecsize;
     t_word *vec;
+    size_t total = buf.data.size();
+    garray_resize_long(pdarray, total);
 
     if (!garray_getfloatwords(pdarray, &vecsize, &vec)) {
         pd_error(x, "[mar~] bad array");
         return;
     }
 
-    int copy = std::min(vecsize, (int)buf.data.size());
-    for (int i = 0; i < copy; i++) {
+    size_t copy = (total < (size_t)vecsize) ? total : (size_t)vecsize;
+
+    for (size_t i = 0; i < copy; i++) {
         vec[i].w_float = buf.data[i];
     }
+
     garray_redraw(pdarray);
 }
 

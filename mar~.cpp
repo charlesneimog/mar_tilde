@@ -495,13 +495,14 @@ static void mar_tilde_open(t_mar_tilde *x, t_symbol *s, int argc, t_atom *argv) 
     const char *dot = strrchr(fullpath, '.');
     bool loaded = false;
 
+#ifndef __EMSCRIPTEN__
     const auto t0 = std::chrono::steady_clock::now();
-
     auto report_time = [&]() {
         const auto t1 = std::chrono::steady_clock::now();
         const auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
         logpost(x, 3, "[mar~] open took %lld µs", (long long)us);
     };
+#endif
 
     if (dot && !strcasecmp(dot, ".mp3")) {
         loaded = load_mp3(x, fullpath);
@@ -518,7 +519,10 @@ static void mar_tilde_open(t_mar_tilde *x, t_symbol *s, int argc, t_atom *argv) 
         canvas_resume_dsp(state);
         return;
     }
+
+#ifndef __EMSCRIPTEN__
     report_time();
+#endif
 
     if (!loaded) {
         x->playing = false;

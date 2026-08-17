@@ -9,7 +9,7 @@
   - MP3 (via minimp3)
   - WAV and AIFF (via AudioFile)
   - FLAC (TODO)
-- High-quality resampling (via r8brain)
+- High-quality resampling (via statically linked libsamplerate)
 
 ## Building
 
@@ -22,7 +22,7 @@ cmake --build build
 
 * [minimp3](https://github.com/lieff/minimp3)
 * [AudioFile](https://github.com/adamstark/AudioFile)
-* [r8brain-free-src](https://github.com/avaneev/r8brain-free-src)
+* [libsamplerate](https://github.com/libsndfile/libsamplerate)
 
 ## Audio Example
 

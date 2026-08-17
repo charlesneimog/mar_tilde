@@ -56,10 +56,18 @@ endif()
 # ╭──────────────────────────────────────╮
 # │              Resampler               │
 # ╰──────────────────────────────────────╯
-cpmaddpackage("gh:avaneev/r8brain-free-src#master")
-if(r8brain-free-src_ADDED)
-    include_directories("${r8brain-free-src_SOURCE_DIR}")
-endif()
+CPMAddPackage(
+    NAME libsamplerate
+    GITHUB_REPOSITORY libsndfile/libsamplerate
+    GIT_TAG 0.2.2
+    OPTIONS
+        "BUILD_SHARED_LIBS OFF"
+        "BUILD_TESTING OFF"
+        "LIBSAMPLERATE_EXAMPLES OFF"
+        "LIBSAMPLERATE_INSTALL OFF")
+
+# The static library is linked into the Pd module, which requires PIC on ELF platforms.
+set_target_properties(samplerate PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # ╭──────────────────────────────────────╮
 # │              Pd Object               │
@@ -68,7 +76,8 @@ pd_add_external(
     mar~
     "${CMAKE_CURRENT_SOURCE_DIR}/mar~.cpp"
     LINK_LIBRARIES
-    AudioFile)
+    AudioFile
+    SampleRate::samplerate)
 pd_add_datafile(mar~ "${CMAKE_CURRENT_SOURCE_DIR}/mar~-help.pd")
 
 file(GLOB audio_files "${CMAKE_CURRENT_SOURCE_DIR}/resources/*")

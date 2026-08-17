@@ -4,12 +4,13 @@
 #include <string.h>
 #include <math.h>
 #include <algorithm>
-#include <memory>
 #include <vector>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
+#include <new>
 
 #define MINIMP3_IMPLEMENTATION
 #include <minimp3_ex.h>
@@ -25,7 +26,7 @@
 #include <AudioFile.h>
 
 // Resampler
-#include <CDSPResampler.h>
+#include <samplerate.h>
 
 static t_class *mar_tilde_class;
 
@@ -98,10 +99,9 @@ typedef struct _mar_tilde {
 // ╭─────────────────────────────────────╮
 // │              RESAMPLER              │
 // ╰─────────────────────────────────────╯
-static bool resample_audio(const AudioBuffer &input, AudioBuffer &output,
-                           double target_samplerate) {
+static bool resample_audio(const AudioBuffer &input, AudioBuffer &output, int target_samplerate) {
     const double source_sr = (double)input.samplerate;
-    const double target_sr = target_samplerate;
+    const double target_sr = (double)target_samplerate;
 
     if (target_sr <= 0.0 || source_sr <= 0.0 || input.empty()) {
         return false;
@@ -113,105 +113,61 @@ static bool resample_audio(const AudioBuffer &input, AudioBuffer &output,
 
     const int ch = input.channels;
     const size_t in_frames = input.frames;
-
     const double ratio = target_sr / source_sr;
-    const size_t estimated_frames = (size_t)ceil((double)in_frames * ratio) + 64;
 
-    std::vector<std::unique_ptr<r8b::CDSPResampler>> resamplers;
-    resamplers.reserve(ch);
-
-    try {
-        for (int c = 0; c < ch; ++c) {
-            resamplers.emplace_back(new r8b::CDSPResampler(source_sr, target_sr, 1024));
-        }
-    } catch (...) {
+    if (!src_is_valid_ratio(ratio) || in_frames > (size_t)std::numeric_limits<long>::max() ||
+        in_frames > std::numeric_limits<size_t>::max() / (size_t)ch) {
         return false;
     }
 
-    std::vector<std::vector<double>> temp_output(ch);
-    std::vector<size_t> write_pos((size_t)ch, 0);
-
-    for (int c = 0; c < ch; ++c) {
-        temp_output[c].resize(estimated_frames);
+    const double requested_frames = ceil((double)in_frames * ratio);
+    if (requested_frames > (double)(std::numeric_limits<long>::max() - 1)) {
+        return false;
     }
 
-    const size_t block = 1024;
-    std::vector<double> in_block(block);
-
-    // FIX: real output buffer (was nullptr before)
-    std::vector<double> out_block(estimated_frames);
-
-    for (size_t pos = 0; pos < in_frames; pos += block) {
-        const size_t n = std::min(block, in_frames - pos);
-
-        for (int c = 0; c < ch; ++c) {
-            for (size_t i = 0; i < n; ++i) {
-                in_block[i] = (double)input.channel_ptr(c)[pos + i];
-            }
-
-            double *outp = out_block.data();
-            int produced = resamplers[c]->process(in_block.data(), (int)n, outp);
-
-            if (produced > 0) {
-                size_t &wp = write_pos[(size_t)c];
-
-                if (wp + (size_t)produced > temp_output[c].size()) {
-                    temp_output[c].resize(wp + produced + 64);
-                }
-
-                std::copy(out_block.data(), out_block.data() + produced,
-                          temp_output[c].begin() + wp);
-
-                wp += produced;
-            }
-        }
+    const size_t output_capacity = (size_t)requested_frames + 1;
+    if (output_capacity > std::numeric_limits<size_t>::max() / (size_t)ch) {
+        return false;
     }
 
-    // flush
-    bool flushing = true;
-    while (flushing) {
-        int produced = -1;
+    try {
+        // libsamplerate processes interleaved channels together, preserving their alignment.
+        std::vector<float> interleaved_input(in_frames * (size_t)ch);
+        std::vector<float> interleaved_output(output_capacity * (size_t)ch);
 
-        for (int c = 0; c < ch; ++c) {
-            double *outp = out_block.data();
-            int p = resamplers[c]->process(nullptr, 0, outp);
-
-            if (c == 0) {
-                produced = p;
-            }
-
-            if (p > 0) {
-                size_t &wp = write_pos[(size_t)c];
-
-                if (wp + (size_t)p > temp_output[c].size()) {
-                    temp_output[c].resize(wp + p + 64);
-                }
-
-                std::copy(out_block.data(), out_block.data() + p, temp_output[c].begin() + wp);
-
-                wp += p;
+        for (size_t frame = 0; frame < in_frames; ++frame) {
+            for (int channel = 0; channel < ch; ++channel) {
+                interleaved_input[frame * (size_t)ch + (size_t)channel] =
+                    (float)input.channel_ptr(channel)[frame];
             }
         }
 
-        if (produced <= 0) {
-            flushing = false;
-        }
-    }
+        SRC_DATA conversion{};
+        conversion.data_in = interleaved_input.data();
+        conversion.data_out = interleaved_output.data();
+        conversion.input_frames = (long)in_frames;
+        conversion.output_frames = (long)output_capacity;
+        conversion.end_of_input = 1;
+        conversion.src_ratio = ratio;
 
-    size_t out_frames = write_pos.empty() ? 0 : write_pos[0];
-    for (int c = 1; c < ch; ++c) {
-        if (write_pos[(size_t)c] != out_frames) {
+        if (src_simple(&conversion, SRC_SINC_BEST_QUALITY, ch) != 0 ||
+            conversion.input_frames_used != (long)in_frames || conversion.output_frames_gen <= 0) {
+            output.clear();
             return false;
         }
-    }
 
-    output.allocate(ch, out_frames, (int)target_sr);
+        const size_t output_frames = (size_t)conversion.output_frames_gen;
+        output.allocate(ch, output_frames, target_samplerate);
 
-    for (int c = 0; c < ch; ++c) {
-        const double *src = temp_output[c].data();
-        t_sample *dst = output.channel_ptr(c);
-
-        std::transform(src, src + out_frames, dst, [](double v) { return (t_sample)v; });
+        for (size_t frame = 0; frame < output_frames; ++frame) {
+            for (int channel = 0; channel < ch; ++channel) {
+                output.channel_ptr(channel)[frame] =
+                    (t_sample)interleaved_output[frame * (size_t)ch + (size_t)channel];
+            }
+        }
+    } catch (...) {
+        output.clear();
+        return false;
     }
 
     return true;
@@ -422,38 +378,85 @@ static bool load_flac(t_mar_tilde *x, const char *fullpath) {
 // ╭─────────────────────────────────────╮
 // │           WAV/AIFF LOADER           │
 // ╰─────────────────────────────────────╯
-static bool load_wav_aiff(t_mar_tilde *x, const char *fullpath) {
+enum class PcmFileType { Wave, Aiff };
+
+static bool has_pcm_header(const char *fullpath, PcmFileType type) {
+    uint8_t header[12]{};
+    FILE *file = fopen(fullpath, "rb");
+    if (!file) {
+        return false;
+    }
+    const size_t bytes_read = fread(header, 1, sizeof(header), file);
+    fclose(file);
+    if (bytes_read != sizeof(header)) {
+        return false;
+    }
+
+    if (type == PcmFileType::Wave) {
+        return memcmp(header, "RIFF", 4) == 0 && memcmp(header + 8, "WAVE", 4) == 0;
+    }
+    return memcmp(header, "FORM", 4) == 0 &&
+           (memcmp(header + 8, "AIFF", 4) == 0 || memcmp(header + 8, "AIFC", 4) == 0);
+}
+
+static bool load_pcm_file(t_mar_tilde *x, const char *fullpath, PcmFileType type) {
+    const char *format_name = type == PcmFileType::Wave ? "WAV" : "AIFF";
+    if (!has_pcm_header(fullpath, type)) {
+        pd_error(x, "[mar~] Invalid or unreadable %s file", format_name);
+        return false;
+    }
+
     AudioFile<float> a;
 
     if (!a.load(fullpath)) {
-        pd_error(x, "[mar~] Failed to load WAV/AIFF file");
+        pd_error(x, "[mar~] Failed to decode %s file", format_name);
         return false;
     }
 
     const int channels = a.getNumChannels();
     const int samplerate = a.getSampleRate();
-    const size_t frames = a.getNumSamplesPerChannel();
+    const int frame_count = a.getNumSamplesPerChannel();
 
-    if (channels <= 0 || frames == 0) {
-        pd_error(x, "[mar~] Invalid audio file format");
+    if (channels <= 0 || samplerate <= 0 || frame_count <= 0 ||
+        a.samples.size() != (size_t)channels) {
+        pd_error(x, "[mar~] Invalid %s stream metadata", format_name);
         return false;
     }
-
-    // Allocate unified buffer
-    x->audio.allocate(channels, frames, samplerate);
-
-    // Copy per-channel data (AudioFile already stores non-interleaved)
-    for (int c = 0; c < channels; ++c) {
-        t_sample *dst = x->audio.channel_ptr(c);
-        for (size_t f = 0; f < frames; ++f) {
-            dst[f] = a.samples[c][f];
+    const size_t frames = (size_t)frame_count;
+    for (int channel = 0; channel < channels; ++channel) {
+        if (a.samples[(size_t)channel].size() != frames) {
+            pd_error(x, "[mar~] Inconsistent %s channel lengths", format_name);
+            return false;
         }
     }
 
-    logpost(x, 3, "[mar~] Loaded %s: %d channels, %d Hz, %zu frames, %d-bit", fullpath, channels,
-            samplerate, frames, a.getBitDepth());
+    AudioBuffer decoded;
+    try {
+        decoded.allocate(channels, frames, samplerate);
+
+        // AudioFile stores WAV and AIFF samples as planar normalized floats.
+        for (int channel = 0; channel < channels; ++channel) {
+            std::copy(a.samples[(size_t)channel].begin(), a.samples[(size_t)channel].end(),
+                      decoded.channel_ptr(channel));
+        }
+    } catch (...) {
+        pd_error(x, "[mar~] Not enough memory to load %s file", format_name);
+        return false;
+    }
+    x->audio = std::move(decoded);
+
+    logpost(x, 3, "[mar~] Loaded %s: %d channels, %d Hz, %zu frames, %d-bit", format_name,
+            channels, samplerate, frames, a.getBitDepth());
 
     return true;
+}
+
+static bool load_wav(t_mar_tilde *x, const char *fullpath) {
+    return load_pcm_file(x, fullpath, PcmFileType::Wave);
+}
+
+static bool load_aiff(t_mar_tilde *x, const char *fullpath) {
+    return load_pcm_file(x, fullpath, PcmFileType::Aiff);
 }
 
 // ─────────────────────────────────────
@@ -506,9 +509,10 @@ static void mar_tilde_open(t_mar_tilde *x, t_symbol *s, int argc, t_atom *argv) 
 
     if (dot && !strcasecmp(dot, ".mp3")) {
         loaded = load_mp3(x, fullpath);
-    } else if (dot && (!strcasecmp(dot, ".wav") || !strcasecmp(dot, ".aiff") ||
-                       !strcasecmp(dot, ".aif"))) {
-        loaded = load_wav_aiff(x, fullpath);
+    } else if (dot && !strcasecmp(dot, ".wav")) {
+        loaded = load_wav(x, fullpath);
+    } else if (dot && (!strcasecmp(dot, ".aiff") || !strcasecmp(dot, ".aif"))) {
+        loaded = load_aiff(x, fullpath);
     } else if (dot && !strcasecmp(dot, ".flac")) {
         loaded = load_flac(x, fullpath);
     } else if (dot && !strcasecmp(dot, ".ogg")) {
@@ -535,7 +539,7 @@ static void mar_tilde_open(t_mar_tilde *x, t_symbol *s, int argc, t_atom *argv) 
     if (x->audio.samplerate != target_sr && x->resample) {
         logpost(x, 3, "[mar~] Resampling from %d Hz to %d Hz", x->audio.samplerate, target_sr);
 
-        if (resample_audio(x->audio, x->resampled, (double)target_sr)) {
+        if (resample_audio(x->audio, x->resampled, target_sr)) {
             x->using_resampled = 1;
         } else {
             pd_error(x, "[mar~] Resampling failed, using original sample rate");
@@ -667,16 +671,20 @@ static void mar_tilde_dsp(t_mar_tilde *x, t_signal **sp) {
 
 // ─────────────────────────────────────
 static void mar_tilde_free(t_mar_tilde *x) {
-    x->audio.clear();
-    x->resampled.clear();
     if (x->clock) {
         clock_free(x->clock);
     }
+    x->resampled.~AudioBuffer();
+    x->audio.~AudioBuffer();
 }
 
 // ─────────────────────────────────────
 static void *mar_tilde_new(t_symbol *s, int argc, t_atom *argv) {
     t_mar_tilde *x = (t_mar_tilde *)pd_new(mar_tilde_class);
+
+    // pd_new allocates raw storage and does not run C++ constructors.
+    new (&x->audio) AudioBuffer();
+    new (&x->resampled) AudioBuffer();
 
     x->playing = 0;
     x->loop = 0;
